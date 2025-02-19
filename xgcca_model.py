@@ -1,156 +1,126 @@
-# xgcca-ssg_model.py
+# xgcca_model.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import dgl
 from dgl.nn import GraphConv
 
-##########################
-# 1. Gumbel Subspace (optional)
-##########################
-class GumbelSubspaceSelector(nn.Module):
+########################################
+# 1) Simple GNN
+########################################
+class SimpleGNN(nn.Module):
     """
-    Differentiable subspace selection for feature dims using Gumbel-Softmax.
+    A minimal two-layer GNN for demonstration.
     """
-    def __init__(self, dim, tau=1.0):
-        super(GumbelSubspaceSelector, self).__init__()
-        self.logits = nn.Parameter(torch.zeros(dim))
-        self.tau = tau
+    def __init__(self, in_dim, hid_dim, out_dim):
+        super().__init__()
+        self.conv1 = GraphConv(in_dim, hid_dim, norm='both')
+        self.conv2 = GraphConv(hid_dim, out_dim, norm='both')
 
-    def forward(self):
+    def forward(self, g, feat):
+        x = self.conv1(g, feat)
+        x = F.relu(x)
+        x = self.conv2(g, x)
+        return x
+
+########################################
+# 2) Soft Discrete Biclique
+########################################
+class SoftDiscreteBicliqueSearch(nn.Module):
+    """
+    Approximates discrete row/column removal with a
+    differentiable gating approach:
+     row_mask[i] = sigmoid(scale*( mean(|C[i,:]|) - threshold + offset[i] ))
+     etc.
+    """
+    def __init__(self, dim, threshold=0.05, scale=50.0):
+        super().__init__()
+        self.dim = dim
+        self.base_thresh = threshold
+        self.scale = scale
+
+        # Offsets can be learnable
+        self.row_offsets = nn.Parameter(torch.zeros(dim))
+        self.col_offsets = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, C):
         """
-        Returns a vector in [0,1]^dim, approximating binary selection.
+        C: [D, D], cross-correlation matrix
+        Return:
+          row_mask, col_mask in (0,1)
         """
-        g_noise = -torch.log(-torch.log(torch.rand_like(self.logits).clamp_min(1e-9)))
-        y = (self.logits + g_noise) / self.tau
-        return torch.sigmoid(y)
+        row_score = C.abs().mean(dim=1)  # shape [D]
+        col_score = C.abs().mean(dim=0)  # shape [D]
 
-##########################
-# 2. BicliqueAttentionLayer
-##########################
-class BicliqueAttentionLayer(nn.Module):
+        row_mask = torch.sigmoid(self.scale * (row_score + self.row_offsets - self.base_thresh))
+        col_mask = torch.sigmoid(self.scale * (col_score + self.col_offsets - self.base_thresh))
+
+        return row_mask, col_mask
+
+########################################
+# 3) xgCCA_SSG model
+########################################
+class XgCCA_SSG(nn.Module):
     """
-    A custom GNN layer that multiplies the input by a 'mask'
-    of selected feature dims, then applies attention-based edge weighting.
+    Combines:
+      - a GNN for each augmented view
+      - a cross-correlation step
+      - a soft discrete biclique subspace search
     """
-    def __init__(self, in_dim, out_dim):
-        super(BicliqueAttentionLayer, self).__init__()
-        self.linear = nn.Linear(in_dim, out_dim, bias=False)
-        self.attn_param = nn.Parameter(torch.FloatTensor(out_dim, 1))
-        nn.init.xavier_uniform_(self.attn_param, gain=1.414)
+    def __init__(self, in_dim, hid_dim, out_dim):
+        super().__init__()
+        # GNN for both views (could define 2 if you want separate weights)
+        self.gnn = SimpleGNN(in_dim, hid_dim, out_dim)
 
-    def edge_attention(self, edges):
-        score = torch.matmul(edges.src['h'], self.attn_param)  # (batch, 1)
-        return {'score': F.leaky_relu(score.squeeze(-1))}
-
-    def forward(self, graph, feat, mask=None):
-        if mask is None:
-            mask = torch.ones(feat.shape[1], device=feat.device)
-        # mask out columns in feat
-        feat_masked = feat * mask.unsqueeze(0)
-        h = self.linear(feat_masked)
-
-        with graph.local_scope():
-            graph.ndata['h'] = h
-            graph.apply_edges(self.edge_attention)
-            alpha = dgl.softmax(graph.edata['score'], graph.edges()[1])
-            graph.edata['alpha'] = alpha
-            graph.update_all(
-                dgl.function.u_mul_e('h', 'alpha', 'm'),
-                dgl.function.sum('m', 'h_new'))
-            h_new = graph.ndata['h_new']
-            return F.relu(h_new)
-
-##########################
-# 3. BicliqueGCN
-##########################
-class BicliqueGCN(nn.Module):
-    """
-    GCN with first & last GraphConv,
-    optional middle layers as BicliqueAttentionLayer.
-    """
-    def __init__(self, in_dim, hid_dim, out_dim, n_layers):
-        super(BicliqueGCN, self).__init__()
-        self.n_layers = n_layers
-        self.layers = nn.ModuleList()
-        if n_layers == 1:
-            # single layer
-            self.layers.append(GraphConv(in_dim, out_dim, norm='both'))
-        else:
-            # first layer
-            self.layers.append(GraphConv(in_dim, hid_dim, norm='both'))
-            # middle layers
-            for _ in range(n_layers - 2):
-                self.layers.append(BicliqueAttentionLayer(hid_dim, hid_dim))
-            # last layer
-            self.layers.append(GraphConv(hid_dim, out_dim, norm='both'))
-
-    def forward(self, graph, x, mask=None):
-        h = x
-        for layer in self.layers:
-            if isinstance(layer, BicliqueAttentionLayer):
-                h = layer(graph, h, mask)
-            else:
-                # standard GraphConv
-                h = layer(graph, h)
-                h = F.relu(h)
-        return h
-
-##########################
-# 4. xgCCA-SSG
-##########################
-class xgCCA_SSG(nn.Module):
-    def __init__(self, in_dim, hid_dim, out_dim, n_layers,
-                 use_gumbel=False, tau=1.0):
-        super(xgCCA_SSG, self).__init__()
-        self.gcn = BicliqueGCN(in_dim, hid_dim, out_dim, n_layers)
-        self.use_gumbel = use_gumbel
-        if use_gumbel:
-            self.selector = GumbelSubspaceSelector(out_dim, tau)
+        # Subspace detection
+        self.subspace = SoftDiscreteBicliqueSearch(dim=out_dim, threshold=0.05, scale=50.0)
 
     def forward(self, g1, x1, g2, x2):
-        # subspace mask
-        if self.use_gumbel:
-            mask = self.selector()
-        else:
-            mask = None
+        # produce embeddings
+        z1 = self.gnn(g1, x1)
+        z2 = self.gnn(g2, x2)
 
-        h1 = self.gcn(g1, x1, mask)
-        h2 = self.gcn(g2, x2, mask)
+        # cross-correlation matrix
+        C = compute_correlation_matrix(z1, z2)
 
-        # feature-wise normalization
-        z1 = (h1 - h1.mean(0)) / (h1.std(0) + 1e-6)
-        z2 = (h2 - h2.mean(0)) / (h2.std(0) + 1e-6)
+        # row/col masks
+        row_mask, col_mask = self.subspace(C)
 
-        return z1, z2
+        # apply them
+        rm = row_mask.unsqueeze(1)  # [D,1]
+        cm = col_mask.unsqueeze(0)  # [1,D]
+        C_masked = C * (rm * cm)    # shape [D, D]
 
-    @torch.no_grad()
-    def get_embedding(self, g, x):
-        if self.use_gumbel:
-            mask = self.selector()
-        else:
-            mask = None
-        out = self.gcn(g, x, mask)
-        return out.detach()
+        return C_masked, row_mask, col_mask, z1, z2
 
-##########################
-# 5. CCA-style Loss
-##########################
-def cca_loss(z1, z2, lambd=1e-3):
+########################################
+# 4) Utilities
+########################################
+def compute_correlation_matrix(z1, z2):
     """
-    invariance term: negative diagonal of cross-correlation
-    decorrelation term: (c1 - I)^2 + (c2 - I)^2
+    z1, z2: [N, D]
+    Return cross-correlation matrix [D, D].
+    Standardize each dimension, then dot-product / N
     """
+    z1_std = (z1 - z1.mean(dim=0)) / (z1.std(dim=0) + 1e-6)
+    z2_std = (z2 - z2.mean(dim=0)) / (z2.std(dim=0) + 1e-6)
     N = z1.size(0)
-    c = (z1.T @ z2) / N     # cross-correlation
-    c1 = (z1.T @ z1) / N
-    c2 = (z2.T @ z2) / N
+    C = z1_std.T @ z2_std / N
+    return C
 
-    loss_inv = -torch.diagonal(c).sum()
+def cca_loss(C_masked, lambd=1e-3):
+    """
+    Example correlation-based objective:
+    invariance = - sum(diagonal(C_masked))
+    decorrelation = punishing off-diagonal from identity
+    """
+    d = C_masked.size(0)
+    diag_sum = torch.diagonal(C_masked).sum()
+    loss_inv = -diag_sum
 
-    d = c.size(0)
-    I = torch.eye(d, device=z1.device)
-    loss_dec1 = (c1 - I).pow(2).sum()
-    loss_dec2 = (c2 - I).pow(2).sum()
+    identity = torch.eye(d, device=C_masked.device)
+    # measure how far from identity
+    diff = (C_masked - identity).pow(2).sum() - (C_masked.diagonal() - 1).pow(2).sum()
+    loss_dec = diff
 
-    return loss_inv + lambd * (loss_dec1 + loss_dec2)
+    return loss_inv + lambd*loss_dec

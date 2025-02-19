@@ -1,18 +1,16 @@
 # aug.py
 import torch as th
 import dgl
-import numpy as np
 
 def random_aug(graph, x, feat_drop_rate=0.2, edge_drop_rate=0.2):
     """
-    Returns an augmented graph and feature matrix:
-      - drop edges randomly
-      - drop feature columns randomly
+    Produce an augmented graph and feature matrix:
+    - drop edges randomly with probability edge_drop_rate
+    - drop feature columns randomly with probability feat_drop_rate
     """
     edge_mask = mask_edge(graph, edge_drop_rate)
     x_aug = drop_feature(x, feat_drop_rate)
 
-    # Build new graph
     aug_graph = dgl.graph([])
     aug_graph.add_nodes(graph.number_of_nodes())
 
@@ -26,9 +24,10 @@ def random_aug(graph, x, feat_drop_rate=0.2, edge_drop_rate=0.2):
 def drop_feature(x, drop_prob):
     """
     Zero out a fraction (drop_prob) of feature columns for all nodes.
+    x shape: (N, D)
     """
-    D = x.shape[1]
-    mask = th.rand(D, device=x.device) < drop_prob  # True means we zero that column
+    D = x.size(1)
+    mask = th.rand(D, device=x.device) < drop_prob
     x_dropped = x.clone()
     x_dropped[:, mask] = 0
     return x_dropped
@@ -40,5 +39,5 @@ def mask_edge(graph, mask_prob):
     """
     E = graph.number_of_edges()
     keep_prob = 1.0 - mask_prob
-    mask = th.rand(E) < keep_prob
-    return mask.nonzero().squeeze()
+    keep_mask = th.rand(E) < keep_prob
+    return keep_mask.nonzero().squeeze()
