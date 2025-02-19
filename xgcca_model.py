@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dgl.nn import GraphConv
+from gcca import select_subspace
 
 class LogReg(nn.Module):
     def __init__(self, hid_dim, out_dim):
@@ -102,33 +103,32 @@ class XgCCA_SSG(nn.Module):
         self.subspace = list(range(out_dim))  # Initial full feature space
 
     def update_subspace(self, current_R):
-        """Update subspace with EMA-smoothed correlation matrix"""
         if self.ema_R is None:
             self.ema_R = current_R
         else:
             self.ema_R = 0.9 * self.ema_R + 0.1 * current_R
-        self.subspace = select_subspace(self.ema_R)
 
-    def get_embedding(self, graph, feat):
-        return self.backbone(graph, feat)
+        # Update subspace and mask
+        self.subspace = select_subspace(self.ema_R)
+        self.subspace_mask.zero_()
+        self.subspace_mask[self.subspace] = 1.0  # Update mask in-place
 
     def forward(self, graph1, feat1, graph2, feat2, epoch=None):
-        # Dynamic subspace update
         if epoch and (epoch % self.subspace_update_freq == 0):
             with torch.no_grad():
-                h1 = self.get_embedding(graph1, feat1)
-                h2 = self.get_embedding(graph2, feat2)
+                h1 = self.backbone(graph1, feat1)
+                h2 = self.backbone(graph2, feat2)
                 current_R = h1.T @ h2 / h1.shape[0]
                 self.update_subspace(current_R)
 
-        # Forward pass with current subspace
+        # Use the updated subspace_mask
         h1 = self.backbone(graph1, feat1, self.subspace_mask)
         h2 = self.backbone(graph2, feat2, self.subspace_mask)
-
-        # Instance-wise normalization
         z1 = F.normalize(h1, p=2, dim=1)
         z2 = F.normalize(h2, p=2, dim=1)
         return z1, z2
+
+
 
     @property
     def subspace_mask(self):

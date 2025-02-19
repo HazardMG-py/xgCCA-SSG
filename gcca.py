@@ -1,3 +1,5 @@
+import torch as th
+
 def select_subspace(R, threshold=0.05, percentile=10):
     """
     Optimized version with batch removal of low-density rows/columns.
