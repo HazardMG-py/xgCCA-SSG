@@ -1,138 +1,156 @@
+# xgcca-ssg_model.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import dgl
 from dgl.nn import GraphConv
-from gcca import select_subspace
 
+##########################
+# 1. Gumbel Subspace (optional)
+##########################
+class GumbelSubspaceSelector(nn.Module):
+    """
+    Differentiable subspace selection for feature dims using Gumbel-Softmax.
+    """
+    def __init__(self, dim, tau=1.0):
+        super(GumbelSubspaceSelector, self).__init__()
+        self.logits = nn.Parameter(torch.zeros(dim))
+        self.tau = tau
 
-class LogReg(nn.Module):
-    def __init__(self, hid_dim, out_dim):
-        super(LogReg, self).__init__()
-        self.fc = nn.Linear(hid_dim, out_dim)
+    def forward(self):
+        """
+        Returns a vector in [0,1]^dim, approximating binary selection.
+        """
+        g_noise = -torch.log(-torch.log(torch.rand_like(self.logits).clamp_min(1e-9)))
+        y = (self.logits + g_noise) / self.tau
+        return torch.sigmoid(y)
 
-    def forward(self, x):
-        return self.fc(x)
-
-
-class MLP(nn.Module):
-    def __init__(self, nfeat, nhid, nclass, use_bn=True):
-        super(MLP, self).__init__()
-        self.layer1 = nn.Linear(nfeat, nhid, bias=True)
-        self.layer2 = nn.Linear(nhid, nclass, bias=True)
-        self.bn = nn.BatchNorm1d(nhid)
-        self.use_bn = use_bn
-        self.act_fn = nn.ReLU()
-
-    def forward(self, _, x):
-        x = self.layer1(x)
-        if self.use_bn:
-            x = self.bn(x)
-        x = self.act_fn(x)
-        x = self.layer2(x)
-        return x
-
-
-class GCN(nn.Module):
-    def __init__(self, in_dim, hid_dim, out_dim, n_layers):
-        super(GCN, self).__init__()
-        self.n_layers = n_layers
-        self.convs = nn.ModuleList()
-        self.convs.append(GraphConv(in_dim, hid_dim, norm='both'))
-        if n_layers > 1:
-            for i in range(n_layers - 2):
-                self.convs.append(GraphConv(hid_dim, hid_dim, norm='both'))
-            self.convs.append(GraphConv(hid_dim, out_dim, norm='both'))
-
-    def forward(self, graph, x):
-        for i in range(self.n_layers - 1):
-            x = F.relu(self.convs[i](graph, x))
-        x = self.convs[-1](graph, x)
-        return x
-
-
+##########################
+# 2. BicliqueAttentionLayer
+##########################
 class BicliqueAttentionLayer(nn.Module):
+    """
+    A custom GNN layer that multiplies the input by a 'mask'
+    of selected feature dims, then applies attention-based edge weighting.
+    """
     def __init__(self, in_dim, out_dim):
-        super().__init__()
-        self.linear = nn.Linear(in_dim, out_dim)
-        # Additive attention instead of dot product
-        self.attn_mlp = nn.Linear(2 * out_dim, 1)  # For concatenated [src||dst] features
-        self.mask_weights = nn.Parameter(torch.ones(in_dim))  # Learnable soft mask
+        super(BicliqueAttentionLayer, self).__init__()
+        self.linear = nn.Linear(in_dim, out_dim, bias=False)
+        self.attn_param = nn.Parameter(torch.FloatTensor(out_dim, 1))
+        nn.init.xavier_uniform_(self.attn_param, gain=1.414)
 
-    def forward(self, graph, feat, biclique_mask=None):
-        # Soft mask application (learned sigmoid weights)
-        feat_masked = feat * torch.sigmoid(self.mask_weights).unsqueeze(0)
+    def edge_attention(self, edges):
+        score = torch.matmul(edges.src['h'], self.attn_param)  # (batch, 1)
+        return {'score': F.leaky_relu(score.squeeze(-1))}
 
+    def forward(self, graph, feat, mask=None):
+        if mask is None:
+            mask = torch.ones(feat.shape[1], device=feat.device)
+        # mask out columns in feat
+        feat_masked = feat * mask.unsqueeze(0)
         h = self.linear(feat_masked)
+
         with graph.local_scope():
             graph.ndata['h'] = h
-            # Compute attention scores using concatenated features
-            graph.apply_edges(
-                lambda edges: {'score': F.leaky_relu(
-                    self.attn_mlp(torch.cat([edges.src['h'], edges.dst['h']], dim=1))
-                )}
-            )
-            # Normalize attention scores
-            graph.edata['a'] = dgl.softmax(graph.edata['score'], graph.edges()[1])
-            # Message passing with attention weights
-            graph.update_all(fn.u_mul_e('h', 'a', 'm'), fn.sum('m', 'h_new'))
-            return graph.ndata['h_new']
+            graph.apply_edges(self.edge_attention)
+            alpha = dgl.softmax(graph.edata['score'], graph.edges()[1])
+            graph.edata['alpha'] = alpha
+            graph.update_all(
+                dgl.function.u_mul_e('h', 'alpha', 'm'),
+                dgl.function.sum('m', 'h_new'))
+            h_new = graph.ndata['h_new']
+            return F.relu(h_new)
 
-
+##########################
+# 3. BicliqueGCN
+##########################
 class BicliqueGCN(nn.Module):
+    """
+    GCN with first & last GraphConv,
+    optional middle layers as BicliqueAttentionLayer.
+    """
     def __init__(self, in_dim, hid_dim, out_dim, n_layers):
-        super().__init__()
+        super(BicliqueGCN, self).__init__()
+        self.n_layers = n_layers
         self.layers = nn.ModuleList()
-        self.layers.append(GraphConv(in_dim, hid_dim, norm='both'))
-        for _ in range(n_layers - 2):
-            self.layers.append(BicliqueAttentionLayer(hid_dim, hid_dim))
-        self.layers.append(GraphConv(hid_dim, out_dim, norm='both'))  # No ReLU in last layer
+        if n_layers == 1:
+            # single layer
+            self.layers.append(GraphConv(in_dim, out_dim, norm='both'))
+        else:
+            # first layer
+            self.layers.append(GraphConv(in_dim, hid_dim, norm='both'))
+            # middle layers
+            for _ in range(n_layers - 2):
+                self.layers.append(BicliqueAttentionLayer(hid_dim, hid_dim))
+            # last layer
+            self.layers.append(GraphConv(hid_dim, out_dim, norm='both'))
 
-    def forward(self, graph, x, biclique_mask=None):
+    def forward(self, graph, x, mask=None):
         h = x
-        for i, layer in enumerate(self.layers):
+        for layer in self.layers:
             if isinstance(layer, BicliqueAttentionLayer):
-                h = F.relu(layer(graph, h, biclique_mask))
+                h = layer(graph, h, mask)
             else:
+                # standard GraphConv
                 h = layer(graph, h)
+                h = F.relu(h)
         return h
 
+##########################
+# 4. xgCCA-SSG
+##########################
+class xgCCA_SSG(nn.Module):
+    def __init__(self, in_dim, hid_dim, out_dim, n_layers,
+                 use_gumbel=False, tau=1.0):
+        super(xgCCA_SSG, self).__init__()
+        self.gcn = BicliqueGCN(in_dim, hid_dim, out_dim, n_layers)
+        self.use_gumbel = use_gumbel
+        if use_gumbel:
+            self.selector = GumbelSubspaceSelector(out_dim, tau)
 
-class XgCCA_SSG(nn.Module):
-    def __init__(self, in_dim, hid_dim, out_dim, n_layers):
-        super(XgCCA_SSG, self).__init__()
-        self.backbone = BicliqueGCN(in_dim, hid_dim, out_dim, n_layers)
-        self.ema_R = None
-        self.subspace_update_freq = 10
-        self.register_buffer('subspace_mask', torch.ones(out_dim))
-        self.subspace = list(range(out_dim))
-
-    def update_subspace(self, current_R):
-        if self.ema_R is None:
-            self.ema_R = current_R
+    def forward(self, g1, x1, g2, x2):
+        # subspace mask
+        if self.use_gumbel:
+            mask = self.selector()
         else:
-            self.ema_R = 0.9 * self.ema_R + 0.1 * current_R
-        new_subspace = select_subspace(self.ema_R)
-        self.subspace_mask.zero_()
-        self.subspace_mask[new_subspace] = 1.0
-        self.subspace = new_subspace
+            mask = None
 
-    def forward(self, graph1, feat1, graph2, feat2, mask=None, epoch=None):
-        if epoch is not None and (epoch % self.subspace_update_freq == 0):
-            with torch.no_grad():
-                h1 = self.backbone(graph1, feat1)  # Graph first, then features.
-                h2 = self.backbone(graph2, feat2)
-                current_R = torch.mm(h1.t(), h2) / h1.shape[0]
-                self.update_subspace(current_R)
-        if mask is None:
-            mask = self.subspace_mask
-        # Swap the order: graph first, then features.
-        h1 = self.backbone(graph1, feat1, mask)
-        h2 = self.backbone(graph2, feat2, mask)
-        z1 = F.normalize(h1, p=2, dim=1)
-        z2 = F.normalize(h2, p=2, dim=1)
+        h1 = self.gcn(g1, x1, mask)
+        h2 = self.gcn(g2, x2, mask)
+
+        # feature-wise normalization
+        z1 = (h1 - h1.mean(0)) / (h1.std(0) + 1e-6)
+        z2 = (h2 - h2.mean(0)) / (h2.std(0) + 1e-6)
+
         return z1, z2
 
-    def get_embedding(self, graph, feat, mask=None):
-        out = self.backbone(graph, feat, mask)
-        return F.normalize(out, p=2, dim=1).detach()
+    @torch.no_grad()
+    def get_embedding(self, g, x):
+        if self.use_gumbel:
+            mask = self.selector()
+        else:
+            mask = None
+        out = self.gcn(g, x, mask)
+        return out.detach()
 
+##########################
+# 5. CCA-style Loss
+##########################
+def cca_loss(z1, z2, lambd=1e-3):
+    """
+    invariance term: negative diagonal of cross-correlation
+    decorrelation term: (c1 - I)^2 + (c2 - I)^2
+    """
+    N = z1.size(0)
+    c = (z1.T @ z2) / N     # cross-correlation
+    c1 = (z1.T @ z1) / N
+    c2 = (z2.T @ z2) / N
+
+    loss_inv = -torch.diagonal(c).sum()
+
+    d = c.size(0)
+    I = torch.eye(d, device=z1.device)
+    loss_dec1 = (c1 - I).pow(2).sum()
+    loss_dec2 = (c2 - I).pow(2).sum()
+
+    return loss_inv + lambd * (loss_dec1 + loss_dec2)
