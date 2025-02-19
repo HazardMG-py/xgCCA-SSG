@@ -23,7 +23,7 @@ if __name__ == '__main__':
     parser.add_argument('--wd2', type=float, default=1e-4, help='Weight decay for linear evaluator.')
     parser.add_argument('--lambd', type=float, default=1e-3, help='Trade-off parameter for decorrelation loss.')
     parser.add_argument('--n_layers', type=int, default=2, help='Number of GNN layers.')
-    parser.add_argument('--use_mlp', action='store_true', default=False, help='Use MLP instead of GNN.')
+    #parser.add_argument('--use_mlp', action='store_true', default=False, help='Use MLP instead of GNN.')
     parser.add_argument('--der', type=float, default=0.2, help='Edge drop ratio.')
     parser.add_argument('--dfr', type=float, default=0.2, help='Feature drop ratio.')
     parser.add_argument('--hid_dim', type=int, default=512, help='Hidden layer dimension.')
@@ -42,7 +42,7 @@ if __name__ == '__main__':
     in_dim = feat.shape[1]
 
     # Initialize xgCCA-SSG model (using our biclique-aware encoder)
-    model = XgCCA_SSG(in_dim, args.hid_dim, args.out_dim, args.n_layers, args.use_mlp)
+    model = XgCCA_SSG(in_dim, args.hid_dim, args.out_dim, args.n_layers)
     model = model.to(args.device)
     optimizer = th.optim.Adam(model.parameters(), lr=args.lr1, weight_decay=args.wd1)
     N = graph.number_of_nodes()
