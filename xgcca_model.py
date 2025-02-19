@@ -98,20 +98,27 @@ class XgCCA_SSG(nn.Module):
     def __init__(self, in_dim, hid_dim, out_dim, n_layers):
         super().__init__()
         self.backbone = BicliqueGCN(in_dim, hid_dim, out_dim, n_layers)
-        self.ema_R = None  # For tracking cross-correlation matrix
-        self.subspace_update_freq = 10  # Update subspace every 10 epochs
-        self.subspace = list(range(out_dim))  # Initial full feature space
+        self.ema_R = None
+        self.subspace_update_freq = 10
+
+        # Initialize subspace_mask as a buffer
+        self.register_buffer('subspace_mask', torch.ones(out_dim))  # Initial mask = all 1s
+        self.subspace = list(range(out_dim))  # Track indices
 
     def update_subspace(self, current_R):
+        """Update both subspace indices and mask"""
         if self.ema_R is None:
             self.ema_R = current_R
         else:
             self.ema_R = 0.9 * self.ema_R + 0.1 * current_R
 
-        # Update subspace and mask
-        self.subspace = select_subspace(self.ema_R)
+        # Get new subspace indices
+        new_subspace = select_subspace(self.ema_R)
+
+        # Update mask in-place
         self.subspace_mask.zero_()
-        self.subspace_mask[self.subspace] = 1.0  # Update mask in-place
+        self.subspace_mask[new_subspace] = 1.0
+        self.subspace = new_subspace  # Update indices
 
     def forward(self, graph1, feat1, graph2, feat2, epoch=None):
         if epoch and (epoch % self.subspace_update_freq == 0):
@@ -121,19 +128,9 @@ class XgCCA_SSG(nn.Module):
                 current_R = h1.T @ h2 / h1.shape[0]
                 self.update_subspace(current_R)
 
-        # Use the updated subspace_mask
+        # Directly use the stored subspace_mask buffer
         h1 = self.backbone(graph1, feat1, self.subspace_mask)
         h2 = self.backbone(graph2, feat2, self.subspace_mask)
         z1 = F.normalize(h1, p=2, dim=1)
         z2 = F.normalize(h2, p=2, dim=1)
         return z1, z2
-
-
-
-    @property
-    def subspace_mask(self):
-        """Convert subspace indices to binary mask"""
-        mask = torch.zeros(self.backbone.layers[-1].out_dim,
-                           device=self.ema_R.device)
-        mask[self.subspace] = 1.0
-        return mask
