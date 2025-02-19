@@ -1,64 +1,42 @@
-import torch as th
-
-
-def select_subspace(R, threshold=0.05):
+def select_subspace(R, threshold=0.05, percentile=10):
     """
-    Given a cross-correlation matrix R (of shape [D, D]),
-    threshold it by keeping only entries with absolute value greater than `threshold`,
-    then iteratively remove rows or columns to maximize the density of the remaining submatrix.
-
-    Returns:
-        selected_indices: a sorted list of feature indices (0-indexed) that form the informative subspace.
+    Optimized version with batch removal of low-density rows/columns.
     """
     D = R.shape[0]
-    # Create binary matrix: 1 if |R_ij| > threshold, else 0.
     M = (th.abs(R) > threshold).float()
-    # Start with all feature indices.
     rows = list(range(D))
     cols = list(range(D))
 
     def current_density(rows, cols):
-        if len(rows) == 0 or len(cols) == 0:
+        if not rows or not cols:
             return 0.0
         subM = M[rows][:, cols]
         return subM.sum().item() / (len(rows) * len(cols))
 
-    curr_density = current_density(rows, cols)
     improved = True
     while improved:
         improved = False
-        best_density = curr_density
-        best_remove = None
-        best_remove_type = None
-        # Try removing each row
-        for r in rows.copy():
-            new_rows = [i for i in rows if i != r]
-            if len(new_rows) == 0:
-                continue
-            candidate = current_density(new_rows, cols)
-            if candidate > best_density:
-                best_density = candidate
-                best_remove = r
-                best_remove_type = 'row'
-        # Try removing each column
-        for c in cols.copy():
-            new_cols = [j for j in cols if j != c]
-            if len(new_cols) == 0:
-                continue
-            candidate = current_density(rows, new_cols)
-            if candidate > best_density:
-                best_density = candidate
-                best_remove = c
-                best_remove_type = 'col'
-        if best_remove is not None:
-            if best_remove_type == 'row':
-                rows.remove(best_remove)
-            else:
-                cols.remove(best_remove)
-            curr_density = best_density
+
+        # Compute row/column sums
+        row_sums = M[rows][:, cols].sum(1)  # Sum over remaining columns
+        col_sums = M[rows][:, cols].sum(0)  # Sum over remaining rows
+
+        # Find rows/columns to remove (bottom 10% by default)
+        row_cutoff = np.percentile(row_sums.cpu().numpy(), percentile)
+        col_cutoff = np.percentile(col_sums.cpu().numpy(), percentile)
+
+        rows_to_remove = [rows[i] for i in range(len(rows)) if row_sums[i] < row_cutoff]
+        cols_to_remove = [cols[j] for j in range(len(cols)) if col_sums[j] < col_cutoff]
+
+        # Try removing batch
+        new_rows = [i for i in rows if i not in rows_to_remove]
+        new_cols = [j for j in cols if j not in cols_to_remove]
+        candidate_density = current_density(new_rows, new_cols)
+
+        if candidate_density > current_density(rows, cols):
+            rows = new_rows
+            cols = new_cols
             improved = True
-    # Use intersection of rows and columns as selected subspace
-    selected = sorted(list(set(rows).intersection(set(cols))))
-    if len(selected) == 0:
-        selected = sorted(list(set(rows).union(set(cols))))
-    return selected
+
+    selected = sorted(list(set(rows).intersection(cols)))
+    return selected if len(selected) > 0 else sorted(rows + cols)
