@@ -79,7 +79,7 @@ if __name__ == '__main__':
 
         # Optionally, you can use this mask during the forward pass of the encoder:
         # For demonstration, we recompute the embeddings with the biclique mask.
-        z1_mask, z2_mask = model(graph1, feat1, graph2, feat2, biclique_mask=biclique_mask)
+        z1_mask, z2_mask = model(graph1, feat1, graph2, feat2, mask=biclique_mask)
 
         # Compute cross-correlation on the selected subspace
         z1_sel = z1_mask[:, selected_indices]

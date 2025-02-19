@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from dgl.nn import GraphConv
 from gcca import select_subspace
 
+
 class LogReg(nn.Module):
     def __init__(self, hid_dim, out_dim):
         super(LogReg, self).__init__()
@@ -11,6 +12,7 @@ class LogReg(nn.Module):
 
     def forward(self, x):
         return self.fc(x)
+
 
 class MLP(nn.Module):
     def __init__(self, nfeat, nhid, nclass, use_bn=True):
@@ -28,6 +30,7 @@ class MLP(nn.Module):
         x = self.act_fn(x)
         x = self.layer2(x)
         return x
+
 
 class GCN(nn.Module):
     def __init__(self, in_dim, hid_dim, out_dim, n_layers):
@@ -96,41 +99,40 @@ class BicliqueGCN(nn.Module):
 
 class XgCCA_SSG(nn.Module):
     def __init__(self, in_dim, hid_dim, out_dim, n_layers):
-        super().__init__()
+        super(XgCCA_SSG, self).__init__()
         self.backbone = BicliqueGCN(in_dim, hid_dim, out_dim, n_layers)
         self.ema_R = None
         self.subspace_update_freq = 10
-
-        # Initialize subspace_mask as a buffer
-        self.register_buffer('subspace_mask', torch.ones(out_dim))  # Initial mask = all 1s
-        self.subspace = list(range(out_dim))  # Track indices
+        self.register_buffer('subspace_mask', torch.ones(out_dim))
+        self.subspace = list(range(out_dim))
 
     def update_subspace(self, current_R):
-        """Update both subspace indices and mask"""
         if self.ema_R is None:
             self.ema_R = current_R
         else:
             self.ema_R = 0.9 * self.ema_R + 0.1 * current_R
-
-        # Get new subspace indices
         new_subspace = select_subspace(self.ema_R)
-
-        # Update mask in-place
         self.subspace_mask.zero_()
         self.subspace_mask[new_subspace] = 1.0
-        self.subspace = new_subspace  # Update indices
+        self.subspace = new_subspace
 
-    def forward(self, graph1, feat1, graph2, feat2, epoch=None):
-        if epoch and (epoch % self.subspace_update_freq == 0):
+    def forward(self, graph1, feat1, graph2, feat2, mask=None, epoch=None):
+        if epoch is not None and (epoch % self.subspace_update_freq == 0):
             with torch.no_grad():
-                h1 = self.backbone(graph1, feat1)
+                h1 = self.backbone(graph1, feat1)  # Graph first, then features.
                 h2 = self.backbone(graph2, feat2)
-                current_R = h1.T @ h2 / h1.shape[0]
+                current_R = torch.mm(h1.t(), h2) / h1.shape[0]
                 self.update_subspace(current_R)
-
-        # Directly use the stored subspace_mask buffer
-        h1 = self.backbone(graph1, feat1, self.subspace_mask)
-        h2 = self.backbone(graph2, feat2, self.subspace_mask)
+        if mask is None:
+            mask = self.subspace_mask
+        # Swap the order: graph first, then features.
+        h1 = self.backbone(graph1, feat1, mask)
+        h2 = self.backbone(graph2, feat2, mask)
         z1 = F.normalize(h1, p=2, dim=1)
         z2 = F.normalize(h2, p=2, dim=1)
         return z1, z2
+
+    def get_embedding(self, graph, feat, mask=None):
+        out = self.backbone(graph, feat, mask)
+        return F.normalize(out, p=2, dim=1).detach()
+
