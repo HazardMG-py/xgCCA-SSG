@@ -1,126 +1,162 @@
-# xgcca_model.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import dgl
 from dgl.nn import GraphConv
 
-########################################
-# 1) Simple GNN
-########################################
-class SimpleGNN(nn.Module):
-    """
-    A minimal two-layer GNN for demonstration.
-    """
-    def __init__(self, in_dim, hid_dim, out_dim):
-        super().__init__()
-        self.conv1 = GraphConv(in_dim, hid_dim, norm='both')
-        self.conv2 = GraphConv(hid_dim, out_dim, norm='both')
 
-    def forward(self, g, feat):
-        x = self.conv1(g, feat)
-        x = F.relu(x)
-        x = self.conv2(g, x)
+class LogReg(nn.Module):
+    """Logistic Regression classifier for evaluation"""
+
+    def __init__(self, hid_dim, out_dim):
+        super().__init__()
+        self.fc = nn.Linear(hid_dim, out_dim)
+
+    def forward(self, x):
+        return self.fc(x)
+
+
+class MLP(nn.Module):
+    """MLP backbone alternative (not recommended for graph data)"""
+
+    def __init__(self, nfeat, nhid, nclass, use_bn=True):
+        super().__init__()
+        self.layer1 = nn.Linear(nfeat, nhid)
+        self.layer2 = nn.Linear(nhid, nclass)
+        self.bn = nn.BatchNorm1d(nhid) if use_bn else None
+        self.act = nn.ReLU()
+
+    def forward(self, _, x):
+        x = self.layer1(x)
+        if self.bn: x = self.bn(x)
+        return self.layer2(self.act(x))
+
+
+class BicliqueAttentionLayer(nn.Module):
+    """GNN layer with biclique-aware attention mechanism"""
+
+    def __init__(self, in_dim, out_dim, num_heads=4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = out_dim // num_heads
+
+        # Multi-head attention parameters
+        self.attn_weights = nn.Parameter(torch.FloatTensor(num_heads, 2 * self.head_dim, 1))
+        self.linear = nn.Linear(in_dim, num_heads * self.head_dim, bias=False)
+
+        # Subspace integration parameters
+        self.subspace_selector = DifferentiableSubspaceSelector(in_dim)
+        nn.init.xavier_uniform_(self.attn_weights)
+
+    def forward(self, graph, feat, temp=0.5):
+        # Generate subspace mask
+        mask = self.subspace_selector(temp)  # [in_dim]
+
+        # Apply mask and transform features
+        feat_masked = feat * mask.unsqueeze(0)  # [N, in_dim]
+        h = self.linear(feat_masked).view(-1, self.num_heads, self.head_dim)  # [N, H, D/H]
+
+        # Compute attention scores
+        with graph.local_scope():
+            graph.ndata['h'] = h
+            graph.apply_edges(self.edge_attention)
+            graph.edata['a'] = dgl.softmax(graph.edata['score'], graph.edges()[1])
+
+            # Multi-head aggregation
+            graph.update_all(self.message_func, self.reduce_func)
+            return graph.ndata['h_new'].view(-1, self.num_heads * self.head_dim)
+
+    def edge_attention(self, edges):
+        h = torch.cat([edges.src['h'], edges.dst['h']], dim=-1)  # [E, H, 2D/H]
+        score = (h @ self.attn_weights).squeeze(-1)  # [E, H]
+        return {'score': F.leaky_relu(score)}
+
+    def message_func(self, edges):
+        return {'m': edges.src['h'] * edges.data['a'].unsqueeze(-1)}
+
+    def reduce_func(self, nodes):
+        return {'h_new': torch.sum(nodes.mailbox['m'], dim=1)}
+
+
+class DifferentiableSubspaceSelector(nn.Module):
+    """Gumbel-softmax based feature subspace selector"""
+
+    def __init__(self, dim):
+        super().__init__()
+        self.logits = nn.Parameter(torch.randn(dim))
+
+    def forward(self, temp=0.5, hard=False):
+        return F.gumbel_softmax(self.logits, tau=temp, hard=hard)[:, 1]  # Returns differentiable mask
+
+
+class BicliqueGCN(nn.Module):
+    """Biclique-aware GNN encoder"""
+
+    def __init__(self, in_dim, hid_dim, out_dim, n_layers):
+        super().__init__()
+        self.layers = nn.ModuleList([GraphConv(in_dim, hid_dim, norm='both')])
+
+        for _ in range(n_layers - 2):
+            self.layers.append(BicliqueAttentionLayer(hid_dim, hid_dim))
+
+        if n_layers > 1:
+            self.layers.append(GraphConv(hid_dim, out_dim, norm='both'))
+
+    def forward(self, graph, x, temp=0.5):
+        for i, layer in enumerate(self.layers):
+            if isinstance(layer, BicliqueAttentionLayer):
+                x = F.relu(layer(graph, x, temp))
+            else:
+                x = layer(graph, x)
+                if i != len(self.layers) - 1:  # No ReLU for last layer
+                    x = F.relu(x)
         return x
 
-########################################
-# 2) Soft Discrete Biclique
-########################################
-class SoftDiscreteBicliqueSearch(nn.Module):
-    """
-    Approximates discrete row/column removal with a
-    differentiable gating approach:
-     row_mask[i] = sigmoid(scale*( mean(|C[i,:]|) - threshold + offset[i] ))
-     etc.
-    """
-    def __init__(self, dim, threshold=0.05, scale=50.0):
-        super().__init__()
-        self.dim = dim
-        self.base_thresh = threshold
-        self.scale = scale
 
-        # Offsets can be learnable
-        self.row_offsets = nn.Parameter(torch.zeros(dim))
-        self.col_offsets = nn.Parameter(torch.zeros(dim))
-
-    def forward(self, C):
-        """
-        C: [D, D], cross-correlation matrix
-        Return:
-          row_mask, col_mask in (0,1)
-        """
-        row_score = C.abs().mean(dim=1)  # shape [D]
-        col_score = C.abs().mean(dim=0)  # shape [D]
-
-        row_mask = torch.sigmoid(self.scale * (row_score + self.row_offsets - self.base_thresh))
-        col_mask = torch.sigmoid(self.scale * (col_score + self.col_offsets - self.base_thresh))
-
-        return row_mask, col_mask
-
-########################################
-# 3) xgCCA_SSG model
-########################################
 class XgCCA_SSG(nn.Module):
-    """
-    Combines:
-      - a GNN for each augmented view
-      - a cross-correlation step
-      - a soft discrete biclique subspace search
-    """
-    def __init__(self, in_dim, hid_dim, out_dim):
+    """Main xgCCA-SSG model with automatic subspace management"""
+
+    def __init__(self, in_dim, hid_dim, out_dim, n_layers):
         super().__init__()
-        # GNN for both views (could define 2 if you want separate weights)
-        self.gnn = SimpleGNN(in_dim, hid_dim, out_dim)
+        self.backbone = BicliqueGCN(in_dim, hid_dim, out_dim, n_layers)
+        self.ema_R = None
+        self.subspace_mask = nn.Parameter(torch.ones(hid_dim), requires_grad=False)
+        self.subspace_update_freq = 5
+        self.temp = 1.0  # Initial Gumbel temperature
 
-        # Subspace detection
-        self.subspace = SoftDiscreteBicliqueSearch(dim=out_dim, threshold=0.05, scale=50.0)
+        # Statistics tracking
+        self.register_buffer('subspace_sizes', torch.zeros(100))
+        self.curr_step = 0
 
-    def forward(self, g1, x1, g2, x2):
-        # produce embeddings
-        z1 = self.gnn(g1, x1)
-        z2 = self.gnn(g2, x2)
+    def update_subspace(self, R):
+        """EMA-based subspace tracking with Gumbel relaxation"""
+        if self.ema_R is None:
+            self.ema_R = R.detach()
+        else:
+            self.ema_R = 0.9 * self.ema_R + 0.1 * R.detach()
 
-        # cross-correlation matrix
-        C = compute_correlation_matrix(z1, z2)
+        # Gradually decrease Gumbel temperature
+        self.temp = max(0.1, 1.0 - self.curr_step * 0.01)
+        self.curr_step += 1
 
-        # row/col masks
-        row_mask, col_mask = self.subspace(C)
+    def forward(self, graph1, feat1, graph2, feat2, epoch=None):
+        # Update subspace every few epochs
+        if epoch and (epoch % self.subspace_update_freq == 0):
+            with torch.no_grad():
+                h1 = self.backbone(graph1, feat1, temp=self.temp)
+                h2 = self.backbone(graph2, feat2, temp=self.temp)
+                self.update_subspace(h1.T @ h2 / h1.size(0))
 
-        # apply them
-        rm = row_mask.unsqueeze(1)  # [D,1]
-        cm = col_mask.unsqueeze(0)  # [1,D]
-        C_masked = C * (rm * cm)    # shape [D, D]
+        # Forward pass with current subspace parameters
+        h1 = self.backbone(graph1, feat1, temp=self.temp)
+        h2 = self.backbone(graph2, feat2, temp=self.temp)
 
-        return C_masked, row_mask, col_mask, z1, z2
+        # Masked normalization
+        z1 = (h1 - h1.mean(0)) / (h1.std(0) + 1e-6)
+        z2 = (h2 - h2.mean(0)) / (h2.std(0) + 1e-6)
 
-########################################
-# 4) Utilities
-########################################
-def compute_correlation_matrix(z1, z2):
-    """
-    z1, z2: [N, D]
-    Return cross-correlation matrix [D, D].
-    Standardize each dimension, then dot-product / N
-    """
-    z1_std = (z1 - z1.mean(dim=0)) / (z1.std(dim=0) + 1e-6)
-    z2_std = (z2 - z2.mean(dim=0)) / (z2.std(dim=0) + 1e-6)
-    N = z1.size(0)
-    C = z1_std.T @ z2_std / N
-    return C
+        return z1 * self.subspace_mask.unsqueeze(0), z2 * self.subspace_mask.unsqueeze(0)
 
-def cca_loss(C_masked, lambd=1e-3):
-    """
-    Example correlation-based objective:
-    invariance = - sum(diagonal(C_masked))
-    decorrelation = punishing off-diagonal from identity
-    """
-    d = C_masked.size(0)
-    diag_sum = torch.diagonal(C_masked).sum()
-    loss_inv = -diag_sum
-
-    identity = torch.eye(d, device=C_masked.device)
-    # measure how far from identity
-    diff = (C_masked - identity).pow(2).sum() - (C_masked.diagonal() - 1).pow(2).sum()
-    loss_dec = diff
-
-    return loss_inv + lambd*loss_dec
+    def get_embedding(self, graph, feat):
+        """Get stabilized embeddings for downstream tasks"""
+        with torch.no_grad():
+            return self.backbone(graph, feat, temp=0.1)  # Use low temp for hard mask

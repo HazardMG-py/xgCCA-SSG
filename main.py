@@ -1,159 +1,118 @@
-# main.py
 import argparse
+import numpy as np
 import torch as th
 import torch.nn as nn
-import torch.optim as optim
-import dgl
+import warnings
+from tqdm import tqdm
 
-from dataset import load_data
+warnings.filterwarnings('ignore')
+
+from xgcca_model import XgCCA_SSG, LogReg
 from aug import random_aug
-from xgcca_model import XgCCA_SSG, cca_loss
+from dataset import load
+from gcca import select_subspace
 
-######################################################
-# A simple logistic regression for evaluation
-######################################################
-class LogReg(nn.Module):
-    def __init__(self, in_dim, out_dim):
-        super().__init__()
-        self.fc = nn.Linear(in_dim, out_dim)
-    def forward(self, x):
-        return self.fc(x)
+def evaluate(logreg, train_embs, val_embs, test_embs, train_labels, val_labels, test_labels, device, max_epochs=2000):
+    logreg = logreg.to(device)
+    optimizer = th.optim.Adam(logreg.parameters(), lr=args.lr2, weight_decay=args.wd2)
+    loss_fn = nn.CrossEntropyLoss()
+    best_val_acc = 0
+    best_test_acc = 0
 
-def main():
-    parser = argparse.ArgumentParser(description="xgCCA-SSG Example")
-    parser.add_argument('--dataname', type=str, default='cora')
-    parser.add_argument('--gpu', type=int, default=-1)
-    parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--lr', type=float, default=1e-3, help='LR for self-supervised')
-    parser.add_argument('--wd', type=float, default=0,    help='Weight decay for self-supervised')
-
-    # Data augmentation
-    parser.add_argument('--edge_drop', type=float, default=0.2)
-    parser.add_argument('--feat_drop', type=float, default=0.2)
-
-    # GNN dims
-    parser.add_argument('--hid_dim', type=int, default=256)
-    parser.add_argument('--out_dim', type=int, default=128)
-    parser.add_argument('--lambda_', type=float, default=1e-3, help='decorrelation trade-off')
-
-    # linear eval
-    parser.add_argument('--lr2', type=float, default=1e-2, help='LR for linear eval')
-    parser.add_argument('--wd2', type=float, default=1e-4, help='WD for linear eval')
-    parser.add_argument('--eval_epochs', type=int, default=2000)
-    args = parser.parse_args()
-
-    device = th.device('cuda:%d'%args.gpu if (args.gpu>=0 and th.cuda.is_available()) else 'cpu')
-
-    ######################################################
-    # 1) Load data
-    ######################################################
-    graph, features, labels, num_classes, train_idx, val_idx, test_idx = load_data(args.dataname)
-    graph = graph.remove_self_loop().add_self_loop()
-    features = features.float()
-
-    print("NumNodes:", graph.number_of_nodes())
-    print("NumEdges:", graph.number_of_edges())
-    print("NumFeats:", features.shape[1])
-    print("NumClasses:", num_classes)
-    print("NumTrainingSamples:", len(train_idx))
-    print("NumValidationSamples:", len(val_idx))
-    print("NumTestSamples:", len(test_idx))
-
-    graph = graph.to(device)
-    features = features.to(device)
-    labels   = labels.to(device)
-
-    ######################################################
-    # 2) Build model
-    ######################################################
-    model = XgCCA_SSG(
-        in_dim=features.shape[1],
-        hid_dim=args.hid_dim,
-        out_dim=args.out_dim
-    ).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.wd)
-
-    ######################################################
-    # 3) Self-supervised training
-    ######################################################
-    for epoch in range(args.epochs):
-        model.train()
+    for epoch in range(max_epochs):
+        logreg.train()
         optimizer.zero_grad()
-
-        # create two augmented views
-        g1, feat1 = random_aug(graph, features, feat_drop_rate=args.feat_drop, edge_drop_rate=args.edge_drop)
-        g2, feat2 = random_aug(graph, features, feat_drop_rate=args.feat_drop, edge_drop_rate=args.edge_drop)
-        g1 = g1.add_self_loop().to(device)
-        g2 = g2.add_self_loop().to(device)
-
-        C_masked, row_mask, col_mask, z1, z2 = model(g1, feat1, g2, feat2)
-        loss = cca_loss(C_masked, lambd=args.lambda_)
-
+        logits = logreg(train_embs)
+        loss = loss_fn(logits, train_labels)
         loss.backward()
         optimizer.step()
 
-        if epoch % 10 == 0:
-            row_keep = (row_mask.detach() > 0.5).sum().item()
-            col_keep = (col_mask.detach() > 0.5).sum().item()
-            print(f"Epoch={epoch:03d}, Loss={loss.item():.4f}, "
-                  f"SelectedRowDim={row_keep}, SelectedColDim={col_keep}")
-
-    ######################################################
-    # 4) Evaluate via linear classifier
-    ######################################################
-    print("=== Evaluation ===")
-    model.eval()
-
-    # Get final node embeddings with the original graph
-    # (We can pass the same graph & features as both 'views',
-    #  or define an identity augmentation.)
-    with th.no_grad():
-        # minimal identity augmentation
-        ig = graph
-        ifeat = features
-        C_m, rm, cm, emb_all, _ = model(ig, ifeat, ig, ifeat)
-        # 'emb_all' is shape [N, out_dim]
-
-    train_embs = emb_all[train_idx]
-    val_embs   = emb_all[val_idx]
-    test_embs  = emb_all[test_idx]
-
-    train_labels = labels[train_idx]
-    val_labels   = labels[val_idx]
-    test_labels  = labels[test_idx]
-
-    logreg = LogReg(train_embs.shape[1], num_classes).to(device)
-    opt2 = th.optim.Adam(logreg.parameters(), lr=args.lr2, weight_decay=args.wd2)
-    loss_fn = nn.CrossEntropyLoss()
-
-    best_val_acc = 0
-    best_test_acc_at_val = 0
-
-    for e in range(args.eval_epochs):
-        logreg.train()
-        opt2.zero_grad()
-
-        logits_train = logreg(train_embs)
-        loss_cls = loss_fn(logits_train, train_labels)
-        loss_cls.backward()
-        opt2.step()
-
+        # Validation
         logreg.eval()
         with th.no_grad():
-            val_logits  = logreg(val_embs)
+            val_logits = logreg(val_embs)
+            val_preds = val_logits.argmax(dim=1)
+            val_acc = (val_preds == val_labels).float().mean().item()
+
             test_logits = logreg(test_embs)
-
-            val_preds  = th.argmax(val_logits,  dim=1)
-            test_preds = th.argmax(test_logits, dim=1)
-
-            val_acc  = (val_preds  == val_labels).float().mean().item()
+            test_preds = test_logits.argmax(dim=1)
             test_acc = (test_preds == test_labels).float().mean().item()
 
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
-                best_test_acc_at_val = test_acc
+                best_test_acc = test_acc
 
-    print(f"Best Val Acc={best_val_acc:.4f}, Test Acc at that Val={best_test_acc_at_val:.4f}")
+    return best_test_acc
+
+def main(args):
+    # Device setup
+    device = th.device(f'cuda:{args.gpu}' if args.gpu != -1 and th.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    # Load dataset
+    graph, feat, labels, num_class, train_idx, val_idx, test_idx = load(args.dataname)
+    in_dim = feat.shape[1]
+    graph = graph.to(device).add_self_loop()
+    feat = feat.to(device)
+    labels = labels.to(device)
+
+    # Initialize model
+    model = XgCCA_SSG(
+        in_dim=in_dim,
+        hid_dim=args.hid_dim,
+        out_dim=args.out_dim,
+        n_layers=args.n_layers
+    ).to(device)
+    optimizer = th.optim.Adam(model.parameters(), lr=args.lr1, weight_decay=args.wd1)
+
+    # Training loop
+    best_loss = float('inf')
+    for epoch in tqdm(range(args.epochs), desc="Pretraining"):
+        model.train()
+        optimizer.zero_grad()
+
+        # Generate augmented views
+        graph1, feat1 = random_aug(graph, feat, args.dfr, args.der)
+        graph2, feat2 = random_aug(graph, feat, args.dfr, args.der)
+        graph1, graph2 = graph1.to(device), graph2.to(device)
+        feat1, feat2 = feat1.to(device), feat2.to(device)
+
+        # Forward pass (model handles subspace updates internally)
+        z1, z2 = model(graph1, feat1, graph2, feat2, epoch=epoch)
+
+        # Compute masked losses
+        R = z1.T @ z2 / z1.shape[0]
+        iden = th.eye(z1.size(1), device=device)
+
+        # Invariance loss: Align biclique features
+        loss_inv = -th.diagonal(R).sum()
+
+        # Decorrelation loss: Minimize off-diagonal terms
+        loss_dec = (z1.T @ z1 - iden).pow(2).sum() + (z2.T @ z2 - iden).pow(2).sum()
+
+        # Total loss
+        loss = loss_inv + args.lambd * loss_dec
+        loss.backward()
+        optimizer.step()
+
+        tqdm.write(f"Epoch {epoch:03d} | Loss: {loss.item():.4f} | Subspace Size: {model.subspace_mask.sum().item():.0f}")
+
+    # Evaluation
+    model.eval()
+    with th.no_grad():
+        embeds = model.get_embedding(graph, feat)
+    test_acc = evaluate(
+        LogReg(embeds.size(1), num_class).to(device),
+        embeds[train_idx], embeds[val_idx], embeds[test_idx],
+        labels[train_idx], labels[val_idx], labels[test_idx],
+        device
+    )
+    print(f"Final Test Accuracy: {test_acc:.4f}")
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(
+        description='xgCCA-SSG: Biclique-Aware Self-Supervised Graph Representation Learning'
+    )
+    # ... (keep existing arguments unchanged)
+    args = parser.parse_args()
+    main(args)
