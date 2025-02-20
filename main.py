@@ -12,6 +12,7 @@ from aug import random_aug
 from dataset import load
 from gcca import select_subspace
 
+
 def evaluate(logreg, train_embs, val_embs, test_embs, train_labels, val_labels, test_labels, device, max_epochs=2000):
     logreg = logreg.to(device)
     optimizer = th.optim.Adam(logreg.parameters(), lr=args.lr2, weight_decay=args.wd2)
@@ -43,6 +44,7 @@ def evaluate(logreg, train_embs, val_embs, test_embs, train_labels, val_labels, 
                 best_test_acc = test_acc
 
     return best_test_acc
+
 
 def main(args):
     # Device setup
@@ -95,7 +97,8 @@ def main(args):
         loss.backward()
         optimizer.step()
 
-        tqdm.write(f"Epoch {epoch:03d} | Loss: {loss.item():.4f} | Subspace Size: {model.subspace_mask.sum().item():.0f}")
+        tqdm.write(
+            f"Epoch {epoch:03d} | Loss: {loss.item():.4f} | Subspace Size: {model.subspace_mask.sum().item():.0f}")
 
     # Evaluation
     model.eval()
@@ -109,10 +112,31 @@ def main(args):
     )
     print(f"Final Test Accuracy: {test_acc:.4f}")
 
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='xgCCA-SSG: Biclique-Aware Self-Supervised Graph Representation Learning'
     )
-    # ... (keep existing arguments unchanged)
+    parser.add_argument('--dataname', type=str, default='cora', help='Name of dataset.')
+    parser.add_argument('--gpu', type=int, default=0, help='GPU index (use -1 for CPU).')
+    parser.add_argument('--epochs', type=int, default=100, help='Training epochs.')
+    parser.add_argument('--lr1', type=float, default=1e-3, help='Learning rate for xgCCA-SSG.')
+    parser.add_argument('--lr2', type=float, default=1e-2, help='Learning rate for linear evaluator.')
+    parser.add_argument('--wd1', type=float, default=0, help='Weight decay for xgCCA-SSG.')
+    parser.add_argument('--wd2', type=float, default=1e-4, help='Weight decay for linear evaluator.')
+    parser.add_argument('--lambd', type=float, default=1e-3, help='Trade-off parameter for decorrelation loss.')
+    parser.add_argument('--n_layers', type=int, default=2, help='Number of GNN layers.')
+    parser.add_argument('--use_mlp', action='store_true', default=False, help='Use MLP instead of GNN.')
+    parser.add_argument('--der', type=float, default=0.2, help='Edge drop ratio.')
+    parser.add_argument('--dfr', type=float, default=0.2, help='Feature drop ratio.')
+    parser.add_argument('--hid_dim', type=int, default=512, help='Hidden layer dimension.')
+    parser.add_argument('--out_dim', type=int, default=512, help='Output layer dimension.')
+    parser.add_argument('--gcca_thresh', type=float, default=0.05, help='Threshold for subspace selection.')
+
     args = parser.parse_args()
+    if args.gpu != -1 and th.cuda.is_available():
+        args.device = 'cuda:{}'.format(args.gpu)
+    else:
+        args.device = 'cpu'
+    print(args)
     main(args)
