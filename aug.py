@@ -1,43 +1,38 @@
 import torch as th
-import numpy as np
 import dgl
 
 
-def random_aug(graph, x, feat_drop_rate, edge_mask_rate):
-    # Get device from input graph
-    device = graph.device
+def random_aug(graph, x, feat_drop_rate=0.2, edge_drop_rate=0.2):
+    """Augment graph and features by dropping edges/features."""
+    # Ensure device consistency: create augmented graph on the same device as input features
+    device = x.device
 
-    # Create new graph on the same device
-    ng = dgl.graph([], device=device)  # <--- Fix here
-    ng.add_nodes(graph.number_of_nodes())
+    # Edge masking (ensure mask is on the correct device)
+    edge_mask = mask_edge(graph, edge_drop_rate)  # Fixed in mask_edge()
 
-    # Edge masking on correct device
-    edge_mask = mask_edge(graph, edge_mask_rate)
+    # Feature dropping
+    x_aug = drop_feature(x, feat_drop_rate)
+
+    # Create augmented graph ON THE SAME DEVICE as input features
+    aug_graph = dgl.graph([], device=device)  # <--- KEY FIX HERE
+    aug_graph.add_nodes(graph.number_of_nodes())
+
+    # Add edges (src/dst are already on correct device via graph.edges())
     src, dst = graph.edges()
-    nsrc = src[edge_mask].to(device)
-    ndst = dst[edge_mask].to(device)
-    ng.add_edges(nsrc, ndst)
+    aug_graph.add_edges(src[edge_mask], dst[edge_mask])
 
-    # Feature masking
-    feat = drop_feature(x, feat_drop_rate)
-    return ng, feat
+    return aug_graph, x_aug
 
 
 def drop_feature(x, drop_prob):
-    drop_mask = th.empty(
-        (x.size(1),),
-        dtype=th.float32,
-        device=x.device  # <--- Ensure mask matches feature device
-    ).uniform_(0, 1) < drop_prob
-    x = x.clone()
-    x[:, drop_mask] = 0
-    return x
+    """Zero out features with probability drop_prob."""
+    mask = th.rand(x.shape[1], device=x.device) > drop_prob  # Use same device as x
+    x_dropped = x.clone()
+    x_dropped[:, ~mask] = 0
+    return x_dropped
 
 
 def mask_edge(graph, mask_prob):
+    """Generate edge mask on the same device as input graph."""
     E = graph.number_of_edges()
-    mask_rates = th.FloatTensor(
-        np.ones(E) * mask_prob
-    ).to(graph.device)  # <--- Create tensor on graph's device
-    masks = th.bernoulli(1 - mask_rates)
-    return masks.bool()
+    return (th.rand(E, device=graph.device) > mask_prob).nonzero().squeeze()  # Use graph's device

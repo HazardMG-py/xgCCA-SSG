@@ -1,55 +1,37 @@
-import torch
-import numpy as np
+import torch as th
 
-
-def select_subspace(R, threshold=0.2, percentile=20):
+def select_subspace(R, threshold=0.05, percentile=10):
     """
-    Identifies biclique subspaces via iterative pruning of low-correlation features.
-
+    Greedy subspace selection (non-differentiable, optional fallback).
     Args:
-        R (torch.Tensor): Cross-correlation matrix [D, D].
-        threshold (float): Minimum absolute correlation to retain.
-        percentile (int): Percentile cutoff for pruning rows/columns.
-
+        R: Cross-correlation matrix [D, D]
+        threshold: Correlation threshold for edge inclusion
+        percentile: Percentile of rows/cols to remove per iteration
     Returns:
-        list: Indices of features forming the biclique subspace.
+        selected: List of indices forming the subspace
     """
     D = R.shape[0]
-    M = (torch.abs(R) > threshold).float()  # Binary mask
-    rows = list(range(D))  # Row indices (features from view A)
-    cols = list(range(D))  # Column indices (features from view B)
+    M = (th.abs(R) > threshold).float()
+    rows, cols = list(range(D)), list(range(D))
 
-    def compute_density(r, c):
-        if not r or not c:
+    def density(rows, cols):
+        if not rows or not cols:
             return 0.0
-        return M[r][:, c].sum().item() / (len(r) * len(c))
+        return M[rows][:, cols].sum().item() / (len(rows) * len(cols))
 
     improved = True
     while improved:
         improved = False
-        # Compute row/column sums within current subspace
-        row_sums = M[rows][:, cols].sum(dim=1)  # Sum over columns
-        col_sums = M[rows][:, cols].sum(dim=0)  # Sum over rows
+        row_sums = M[rows][:, cols].sum(1)
+        col_sums = M[rows][:, cols].sum(0)
+        row_cutoff = th.quantile(row_sums, percentile / 100)
+        col_cutoff = th.quantile(col_sums, percentile / 100)
 
-        # Determine cutoffs based on percentile
-        row_cutoff = np.percentile(row_sums.cpu().numpy(), percentile)
-        col_cutoff = np.percentile(col_sums.cpu().numpy(), percentile)
-
-        # Identify weak rows/columns
-        weak_rows = [rows[i] for i, s in enumerate(row_sums) if s < row_cutoff]
-        weak_cols = [cols[j] for j, s in enumerate(col_sums) if s < col_cutoff]
-
-        # Propose new subspace
-        new_rows = [i for i in rows if i not in weak_rows]
-        new_cols = [j for j in cols if j not in weak_cols]
-        new_density = compute_density(new_rows, new_cols)
-
-        # Update if density improves
-        if new_density > compute_density(rows, cols):
+        new_rows = [r for r in rows if row_sums[rows.index(r)] >= row_cutoff]
+        new_cols = [c for c in cols if col_sums[cols.index(c)] >= col_cutoff]
+        if density(new_rows, new_cols) > density(rows, cols):
             rows, cols = new_rows, new_cols
             improved = True
 
-    # Biclique = features surviving in both rows and columns
-    biclique = sorted(list(set(rows).intersection(cols)))
-    # Fallback: Use union if biclique is empty (avoid returning empty list)
-    return biclique if biclique else sorted(list(set(rows + cols)))
+    selected = sorted(list(set(rows).intersection(cols)))
+    return selected if selected else list(range(D))
