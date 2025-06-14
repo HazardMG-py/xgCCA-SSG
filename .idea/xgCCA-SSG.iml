@@ -5,8 +5,4 @@
     <orderEntry type="jdk" jdkName="C:\Users\okwar\anaconda3" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>
-  <component name="PyDocumentationSettings">
-    <option name="format" value="GOOGLE" />
-    <option name="myDocStringFormat" value="Google" />
-  </component>
 </module>
